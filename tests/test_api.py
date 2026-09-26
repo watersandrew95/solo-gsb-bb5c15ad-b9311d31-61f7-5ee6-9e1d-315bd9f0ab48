@@ -234,6 +234,153 @@ def test_all_budgets_and_filter(client):
     assert client.get("/api/v1/budgets?showcase_id=4242").status_code == 404
 
 
+def test_lighting_preview_basic_and_no_side_effects(client):
+    """试算：撤去一盏灯并新增一段照明，对比年度曝光；试算不改库。
+
+    现状区间：08:00-18:00 50 lux；10:00-12:00 200 lux（重叠取 max）
+      → 现状年度曝光 = 50*8 + 200*2 = 800 lux·h（上限 1000，不超标）
+    试算：撤去 200 lux 区间，新增 次日 08:00-16:00 80 lux
+      → 试算曝光 = 50*10 + 80*8 = 1140 lux·h，差额 +340
+      → 首日累计 500，次日还需 500，80 lux → 6.25h，即次日 14:15 首次超标
+    """
+    case_id = _create_case(client, name="试算柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "绢画", "sensitivity": "high", "annual_limit_lux_hours": 1000},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 200},
+        ]},
+    )
+    ids = [iv["id"] for iv in r.json()]
+    before = client.get(f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/lighting-preview",
+        json={
+            "day": "2026-03-01",
+            "remove_interval_ids": [ids[1]],
+            "add_intervals": [
+                {"start": "2026-03-02T08:00:00Z", "end": "2026-03-02T16:00:00Z", "lux": 80}
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["year"] == 2026
+    assert body["removed_interval_ids"] == [ids[1]]
+    assert body["added_interval_count"] == 1
+    item = body["exhibits"][0]
+    assert item["current_total_lux_hours"] == 800.0
+    assert item["preview_total_lux_hours"] == 1140.0
+    assert item["delta_lux_hours"] == 340.0
+    assert item["current_first_exceed_at"] is None
+    assert item["preview_first_exceed_at"].startswith("2026-03-02T14:15:00")
+
+    # 试算不落库：预算接口结果与试算前完全一致，已存区间不变
+    after = client.get(f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+    assert after == before
+    stored = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+    assert [iv["id"] for iv in stored] == ids
+
+
+def test_lighting_preview_reject_invalid_remove_ids(client):
+    c1 = _create_case(client, name="试算柜甲")
+    c2 = _create_case(client, name="试算柜乙")
+    r = client.post(
+        f"/api/v1/showcases/{c2}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T10:00:00Z", "lux": 50}
+        ]},
+    )
+    foreign_id = r.json()[0]["id"]
+
+    # 属于其他展柜的区间 ID → 404
+    r = client.post(
+        f"/api/v1/showcases/{c1}/lighting-preview",
+        json={"day": "2026-03-01", "remove_interval_ids": [foreign_id], "add_intervals": []},
+    )
+    assert r.status_code == 404
+    # 不存在的区间 ID → 404
+    r = client.post(
+        f"/api/v1/showcases/{c1}/lighting-preview",
+        json={"day": "2026-03-01", "remove_interval_ids": [999999], "add_intervals": []},
+    )
+    assert r.status_code == 404
+    # 未知展柜 → 404
+    r = client.post(
+        "/api/v1/showcases/4242/lighting-preview",
+        json={"day": "2026-03-01", "remove_interval_ids": [], "add_intervals": []},
+    )
+    assert r.status_code == 404
+
+
+def test_lighting_preview_reuses_interval_validation(client):
+    case_id = _create_case(client, name="试算校验柜")
+    # 负照度 → 422
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/lighting-preview",
+        json={"day": "2026-03-01", "remove_interval_ids": [], "add_intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T10:00:00Z", "lux": -1}
+        ]},
+    )
+    assert r.status_code == 422
+    # 反向区间 → 422
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/lighting-preview",
+        json={"day": "2026-03-01", "remove_interval_ids": [], "add_intervals": [
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T08:00:00Z", "lux": 50}
+        ]},
+    )
+    assert r.status_code == 422
+
+
+def test_lighting_preview_unlimited_exhibit_and_cross_year(client):
+    """不限量展品越限时刻为 null；跨年区间只计入查询年。"""
+    case_id = _create_case(client, name="试算不限量柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "石雕", "sensitivity": "low"},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            # 跨年区间：仅 2026-01-01 00:00-04:00 这 4 小时计入 2026 年
+            {"start": "2025-12-31T20:00:00Z", "end": "2026-01-01T04:00:00Z", "lux": 100},
+        ]},
+    )
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/lighting-preview",
+        json={"day": "2026-06-01", "remove_interval_ids": [], "add_intervals": [
+            {"start": "2026-06-01T00:00:00Z", "end": "2026-06-01T02:00:00Z", "lux": 30}
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    item = r.json()["exhibits"][0]
+    assert item["annual_limit_lux_hours"] is None
+    assert item["current_total_lux_hours"] == 400.0
+    assert item["preview_total_lux_hours"] == 460.0
+    assert item["delta_lux_hours"] == 60.0
+    assert item["current_first_exceed_at"] is None
+    assert item["preview_first_exceed_at"] is None
+
+
+def test_lighting_preview_default_day_is_today(client):
+    case_id = _create_case(client, name="试算默认日柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/lighting-preview",
+        json={"remove_interval_ids": [], "add_intervals": []},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["year"] == datetime.now(timezone.utc).year
+    assert body["exhibits"] == []
+
+
 def test_persistence_across_connections(client, tmp_path):
     """同一 DB_PATH 下新建客户端连接，数据仍在（验证 SQLite 落盘）。"""
     case_id = _create_case(client, name="持久化柜")

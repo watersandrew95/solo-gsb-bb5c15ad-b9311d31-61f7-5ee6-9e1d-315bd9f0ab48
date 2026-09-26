@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..budget import resolve_limit
+from ..budget import build_exhibit_preview, load_case_intervals, resolve_limit
 from ..database import get_db
 from ..schemas import (
     ExhibitCreate,
@@ -14,10 +14,12 @@ from ..schemas import (
     ExhibitUpdate,
     LightIntervalBulk,
     LightIntervalOut,
+    LightingPreviewIn,
+    LightingPreviewOut,
     ShowcaseCreate,
     ShowcaseOut,
 )
-from ..timeline import day_bounds, fmt_utc, parse_utc
+from ..timeline import day_bounds, fmt_utc, merge_intervals, parse_utc
 
 router = APIRouter(prefix="/api/v1", tags=["showcases"])
 
@@ -185,3 +187,62 @@ def list_intervals(
         ).fetchall()
 
     return [_serialize_interval(r) for r in rows]
+
+
+# --------------------------------------------------------------- 照明试算
+
+@router.post(
+    "/showcases/{showcase_id}/lighting-preview",
+    response_model=LightingPreviewOut,
+    summary="照明调整试算：对比撤去/新增区间前后的年度曝光（不落库）",
+)
+def lighting_preview(showcase_id: int, body: LightingPreviewIn, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    if body.day is None:
+        query_dt = datetime.now(timezone.utc)
+    else:
+        query_dt = datetime(body.day.year, body.day.month, body.day.day, tzinfo=timezone.utc)
+    year = query_dt.year
+
+    # 撤去项必须属于该展柜；不存在或属于其他展柜的 ID 一律 404
+    removed_ids = sorted(set(body.remove_interval_ids))
+    if removed_ids:
+        placeholders = ",".join("?" for _ in removed_ids)
+        rows = conn.execute(
+            f"""
+            SELECT id FROM light_intervals
+            WHERE showcase_id = ? AND id IN ({placeholders})
+            """,
+            (showcase_id, *removed_ids),
+        ).fetchall()
+        found = {r["id"] for r in rows}
+        missing = [i for i in removed_ids if i not in found]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"展柜 {showcase_id} 下不存在照明区间：{missing}",
+            )
+
+    # 现状与调整后两条时间线：同批区间分别合并（重叠取最大照度），全程不写库
+    removed = set(removed_ids)
+    intervals = load_case_intervals(conn, showcase_id, year)
+    current_segments = merge_intervals([(s, e, x) for _, s, e, x in intervals])
+    adjusted = [(s, e, x) for i, s, e, x in intervals if i not in removed]
+    adjusted += [(iv.start, iv.end, iv.lux) for iv in body.add_intervals]
+    preview_segments = merge_intervals(adjusted)
+
+    exhibits = conn.execute(
+        "SELECT * FROM exhibits WHERE showcase_id = ? ORDER BY id", (showcase_id,)
+    ).fetchall()
+    return {
+        "showcase_id": showcase["id"],
+        "showcase_name": showcase["name"],
+        "query_date": query_dt,
+        "year": year,
+        "removed_interval_ids": removed_ids,
+        "added_interval_count": len(body.add_intervals),
+        "exhibits": [
+            build_exhibit_preview(e, current_segments, preview_segments, year)
+            for e in exhibits
+        ],
+    }
