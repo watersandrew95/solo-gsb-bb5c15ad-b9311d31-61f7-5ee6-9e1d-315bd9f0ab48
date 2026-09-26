@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -159,6 +159,53 @@ class ShowcaseBudgetOut(BaseModel):
     showcase_name: str
     query_date: datetime
     exhibits: list[ExhibitBudgetOut]
+
+
+class LightingPreviewIn(BaseModel):
+    """照明调整试算请求：临时撤去若干既有区间，并拟新增若干区间。
+
+    仅用于试算，不改动数据库中的已存区间；时间与照度校验沿用
+    ``LightIntervalIn`` 的规则（UTC 归一化、end > start、0–100000 lux）。
+    """
+
+    day: date = Field(description="查询日（UTC）；试算在其所属公历年（UTC）内进行")
+    remove_interval_ids: list[int] = Field(
+        default_factory=list, description="要暂时撤去的既有照明区间 ID（必须属于该展柜）"
+    )
+    add_intervals: list[LightIntervalIn] = Field(
+        default_factory=list, description="拟新增的照明区间"
+    )
+
+
+class ExhibitLightingPreviewOut(BaseModel):
+    """单件展品的照明调整试算结果：现状 vs 调整后的年度曝光对比。"""
+
+    exhibit_id: int
+    exhibit_name: str
+    sensitivity: Sensitivity
+    annual_limit_lux_hours: Optional[float]
+    year: int
+    current_total_lux_hours: float = Field(description="现状年度曝光（lux·hour）")
+    preview_total_lux_hours: float = Field(description="调整后年度曝光（lux·hour）")
+    delta_lux_hours: float = Field(description="差额 = 调整后 − 现状（负值表示曝光减少）")
+    current_first_exceed_at: Optional[datetime] = Field(
+        default=None, description="现状首次超出年度上限的时刻；不限量展品为 null"
+    )
+    preview_first_exceed_at: Optional[datetime] = Field(
+        default=None, description="调整后首次超出年度上限的时刻；不限量展品为 null"
+    )
+
+
+class LightingPreviewOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    query_date: datetime
+    year: int
+    removed_interval_ids: list[int] = Field(description="本次试算实际撤去的区间 ID")
+    added_intervals: list[LightIntervalOut] = Field(
+        description="本次试算拟新增的区间（id / showcase_id 为回显占位，未入库）"
+    )
+    exhibits: list[ExhibitLightingPreviewOut]
 
 
 class HealthOut(BaseModel):

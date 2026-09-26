@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .database import init_db, session
-from .routers import reports, showcases
+from .routers import preview, reports, showcases
 
 APP_TITLE = "博物馆展柜照度预算 API"
 
@@ -56,6 +56,7 @@ def create_app() -> FastAPI:
 
     app.include_router(showcases.router)
     app.include_router(reports.router)
+    app.include_router(preview.router)
     return app
 
 

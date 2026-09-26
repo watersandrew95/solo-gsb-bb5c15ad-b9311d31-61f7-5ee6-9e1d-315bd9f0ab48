@@ -50,6 +50,61 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/intervals \
 curl -s "localhost:8000/api/v1/showcases/1/budget?day=2026-09-18"
 ```
 
+### 照明调整试算（不落库）
+
+`POST /api/v1/showcases/{id}/lighting-preview` 用于在真正调整照明前先做试算：
+给定**查询日**，临时**撤去**若干既有区间（按 ID）并**拟新增**若干区间，服务在查询日
+所属 UTC 公历年内，分别按现状与调整后区间重新执行"重叠取最大照度"的合并与曝光积分
+（跨年区间只计入当年），按展品返回**现状 / 试算年度曝光、差额与首次超限时刻**。
+试算全程在内存中完成，**不改动已存区间**，预算接口结果不受影响。
+
+```bash
+# 撤去区间 3、5，新增一段 09:00–11:00 300 lux 的重点照明，试算 2026 年度影响
+curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "day": "2026-09-18",
+    "remove_interval_ids": [3, 5],
+    "add_intervals": [
+      {"start": "2026-09-18T09:00:00Z", "end": "2026-09-18T11:00:00Z", "lux": 300}
+    ]
+  }'
+```
+
+响应示例：
+
+```json
+{
+  "showcase_id": 1,
+  "showcase_name": "敦煌展厅A柜",
+  "query_date": "2026-09-18T00:00:00Z",
+  "year": 2026,
+  "removed_interval_ids": [3, 5],
+  "added_intervals": [{
+    "id": 0, "showcase_id": 1,
+    "start": "2026-09-18T09:00:00Z", "end": "2026-09-18T11:00:00Z", "lux": 300.0
+  }],
+  "exhibits": [{
+    "exhibit_id": 1,
+    "exhibit_name": "唐代绢画",
+    "sensitivity": "high",
+    "annual_limit_lux_hours": 500.0,
+    "year": 2026,
+    "current_total_lux_hours": 850.0,
+    "preview_total_lux_hours": 1200.0,
+    "delta_lux_hours": 350.0,
+    "current_first_exceed_at": "2026-09-18T13:00:00Z",
+    "preview_first_exceed_at": "2026-09-18T11:40:00Z"
+  }]
+}
+```
+
+- `delta_lux_hours = 试算 − 现状`（负值表示调整后曝光减少）。
+- 不限量展品（`annual_limit_lux_hours` 为 `null`）的两个越限时刻字段恒为 `null`。
+- `remove_interval_ids` 中若有不属于该展柜（或不存在）的区间 ID → `404`；
+  `added_intervals` 的 `id` 为回显占位（未入库）。
+- `add_intervals` 沿用现有时间与照度校验（`end > start`、`0 ≤ lux ≤ 100000`），非法输入 → `422`。
+
 响应示例（重叠段 12:00–13:00 取 max(50,300)=300 lux；首日累计 650 lux·h，13:00 首次超标）：
 
 ```json
@@ -123,6 +178,7 @@ curl -s "localhost:8000/api/v1/showcases/1/budget?day=2026-09-18"
 | PATCH | `/api/v1/exhibits/{id}` | 展品移柜（目标柜未知 → 404） |
 | POST | `/api/v1/showcases/{id}/intervals` | **批量提交照明区间** |
 | GET | `/api/v1/showcases/{id}/intervals?day=YYYY-MM-DD` | 区间查询，**可按日期过滤** |
+| POST | `/api/v1/showcases/{id}/lighting-preview` | **照明调整试算**（撤去 / 新增区间，不落库） |
 | GET | `/api/v1/showcases/{id}/budget?day=YYYY-MM-DD` | **按展柜 + 日期查预算** |
 | GET | `/api/v1/exhibits/{id}/budget?day=YYYY-MM-DD` | 按单件展品查预算 |
 | GET | `/api/v1/budgets?showcase_id=&day=` | 跨展柜批量预算（不带 id 返回全部） |
@@ -141,8 +197,9 @@ app/
 ├── budget.py          # 报表组装服务
 └── routers/
     ├── showcases.py   # 展柜 / 展品 / 照明区间
-    └── reports.py     # 预算查询
-tests/                 # pytest：算法单测 + API 集成测试（22 项）
+    ├── reports.py     # 预算查询
+    └── preview.py     # 照明调整试算（不落库）
+tests/                 # pytest：算法单测 + API 集成测试（25 项）
 Dockerfile             # python:3.12-slim + HEALTHCHECK
 docker-compose.yml     # 单命令启动 + 数据卷
 ```

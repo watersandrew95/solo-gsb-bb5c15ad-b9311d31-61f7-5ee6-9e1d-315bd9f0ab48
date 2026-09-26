@@ -7,6 +7,7 @@ from datetime import datetime
 from .schemas import (
     STANDARD_ANNUAL_LIMITS,
     ExhibitBudgetOut,
+    ExhibitLightingPreviewOut,
     Sensitivity,
 )
 from .timeline import (
@@ -46,21 +47,33 @@ def load_case_segments(
     跨年区间（年初之前开始 / 年末之后结束）也会取出，裁剪在算法侧完成。
     时间戳为定长 ISO(UTC) 字符串，字典序即可完成粗过滤，再由合并算法精确裁剪。
     """
+    return merge_intervals(
+        [row[:3] for row in load_case_intervals(conn, showcase_id, year)]
+    )
+
+
+def load_case_intervals(
+    conn: sqlite3.Connection, showcase_id: int, year: int
+) -> list[tuple[datetime, datetime, float, int]]:
+    """取出展柜在指定年度内可能产生曝光的全部区间（含区间 ID），不做合并。
+
+    与 ``load_case_segments`` 使用同一过滤窗口；照明调整试算需要按 ID
+    撤去部分区间后再重新合并，因此保留原始区间。
+    """
     year_start, next_year = year_bounds(year)
     rows = conn.execute(
         """
-        SELECT start_ts, end_ts, lux FROM light_intervals
+        SELECT id, start_ts, end_ts, lux FROM light_intervals
         WHERE showcase_id = ?
           AND end_ts > ? AND start_ts < ?
         ORDER BY start_ts
         """,
         (showcase_id, year_start.isoformat(), next_year.isoformat()),
     ).fetchall()
-    intervals = [
-        (parse_utc(r["start_ts"]), parse_utc(r["end_ts"]), float(r["lux"]))
+    return [
+        (parse_utc(r["start_ts"]), parse_utc(r["end_ts"]), float(r["lux"]), int(r["id"]))
         for r in rows
     ]
-    return merge_intervals(intervals)
 
 
 def build_exhibit_budget(
@@ -127,3 +140,54 @@ def resolve_limit(sensitivity: Sensitivity, override: float | None) -> float | N
     if override is not None:
         return override
     return STANDARD_ANNUAL_LIMITS[sensitivity]
+
+
+def build_lighting_preview(
+    exhibits: list[sqlite3.Row],
+    intervals: list[tuple[datetime, datetime, float, int]],
+    remove_ids: set[int],
+    add_intervals: list[tuple[datetime, datetime, float]],
+    year: int,
+) -> tuple[list[ExhibitLightingPreviewOut], list[int]]:
+    """照明调整试算：现状 vs（撤去 remove_ids + 新增 add_intervals）的年度曝光对比。
+
+    现状与调整后各自重新执行"重叠取最大照度"的合并与年度曝光积分；
+    跨年区间只计入 ``year`` 当年（由年度窗口裁剪保证）。纯内存计算，
+    不触碰数据库。返回每件展品的对比结果，以及实际被撤去的区间 ID
+    （按区间开始时间排序，便于复现）。
+    """
+    year_start, next_year = year_bounds(year)
+
+    baseline = [iv[:3] for iv in intervals]
+    kept = [iv[:3] for iv in intervals if iv[3] not in remove_ids]
+    # intervals 已按开始时间排序，过滤后顺序稳定，便于复现
+    removed_ids = [iv[3] for iv in intervals if iv[3] in remove_ids]
+
+    current_segments = merge_intervals(baseline)
+    preview_segments = merge_intervals(kept + list(add_intervals))
+
+    results: list[ExhibitLightingPreviewOut] = []
+    for exhibit in exhibits:
+        limit = _effective_limit(exhibit)
+        current_total = integrate_within(current_segments, year_start, next_year)
+        preview_total = integrate_within(preview_segments, year_start, next_year)
+        if limit is None:
+            current_exceed = preview_exceed = None
+        else:
+            current_exceed = first_exceed_time(current_segments, limit, year_start)
+            preview_exceed = first_exceed_time(preview_segments, limit, year_start)
+        results.append(
+            ExhibitLightingPreviewOut(
+                exhibit_id=exhibit["id"],
+                exhibit_name=exhibit["name"],
+                sensitivity=Sensitivity(exhibit["sensitivity"]),
+                annual_limit_lux_hours=None if limit is None else _r(limit),
+                year=year,
+                current_total_lux_hours=_r(current_total),
+                preview_total_lux_hours=_r(preview_total),
+                delta_lux_hours=_r(preview_total - current_total),
+                current_first_exceed_at=current_exceed,
+                preview_first_exceed_at=preview_exceed,
+            )
+        )
+    return results, removed_ids
